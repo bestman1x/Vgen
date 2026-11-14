@@ -4,11 +4,15 @@ import asyncio
 import json
 import logging
 import os
-os.system("playwright install chromium")
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
-# Safely import playwright-stealth (handles both v1 and v2 of the library)
+# ============================================================
+# CRITICAL FIX: Install the Chromium binary for Streamlit Cloud
+# ============================================================
+os.system("playwright install chromium")
+
+# Safely import playwright-stealth
 try:
     from playwright_stealth import Stealth
     HAS_STEALTH_CLASS = True
@@ -68,7 +72,6 @@ async def run_scraper(url):
     try:
         status_text.info("Initializing browser...")
         
-        # Handle the Playwright context based on which stealth version is installed
         if HAS_STEALTH_CLASS:
             p_manager = Stealth().use_async(async_playwright())
         else:
@@ -76,55 +79,43 @@ async def run_scraper(url):
 
         async with p_manager as p:
             browser = await p.chromium.launch(headless=True)
+            
+            # Force a desktop layout so VGen doesn't hide text names
             context = await browser.new_context(
                 user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                             "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36")
+                            "Chrome/120.0.0.0 Safari/537.36"),
+                viewport={"width": 1920, "height": 1080}
             )
             page = await context.new_page()
             page.set_default_timeout(15000)
 
-            # Apply stealth if using the older stealth_async version
             if HAS_STEALTH_CLASS is False:
                 await stealth_async(page)
 
-            # ------------------------------------------------
-            # NAVIGATION
-            # ------------------------------------------------
             status_text.info("Opening VGen profile...")
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            
-            if response and response.status >= 400:
-                raise RuntimeError(f"VGen returned HTTP {response.status}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # ------------------------------------------------
-            # FIND REVIEWS BUTTON
-            # ------------------------------------------------
             status_text.info("Looking for reviews...")
             review_button = page.locator("div.chipButton", has_text="reviews").first
 
             try:
                 await review_button.wait_for(state="visible", timeout=15000)
             except PlaywrightTimeoutError:
-                raise RuntimeError("Reviews button was not found. The profile may be unavailable or the page structure may have changed.")
+                raise RuntimeError("Reviews button was not found.")
 
             await review_button.click()
+            await asyncio.sleep(3)
 
-            # ------------------------------------------------
-            # WAIT FOR REVIEW CARDS
-            # ------------------------------------------------
             review_selector = "div[class*='Review__Container']"
             review_cards = page.locator(review_selector)
 
             try:
                 await review_cards.first.wait_for(state="visible", timeout=15000)
             except PlaywrightTimeoutError:
-                status_text.warning("The reviews section opened, but no review cards were found.")
+                status_text.warning("No review cards were found.")
                 return []
 
-            # ------------------------------------------------
-            # PAGINATION
-            # ------------------------------------------------
             page_num = 1
             while True:
                 status_text.info(f"Extracting usernames from page {page_num}...")
@@ -132,71 +123,62 @@ async def run_scraper(url):
                 current_page_names = []
 
                 for card in cards:
+                    name = None
                     try:
-                        name_element = card.locator("p.displayName")
-                        name = (await name_element.inner_text()).strip()
+                        # 1. Try the specific displayName paragraph
+                        name_el = card.locator("p.displayName")
+                        if await name_el.count() > 0:
+                            name = (await name_el.first.inner_text()).strip()
+                        
+                        # 2. Try any link that points to a VGen profile
+                        if not name:
+                            link_el = card.locator("a[href*='vgen.co/']")
+                            if await link_el.count() > 0:
+                                href = await link_el.first.get_attribute("href")
+                                if href:
+                                    name = href.split("vgen.co/")[-1].split("?")[0].strip("/")
+                        
+                        # 3. Try grabbing the first line of the reviewer details
+                        if not name:
+                            details_el = card.locator("div[class*='reviewerDetails']")
+                            if await details_el.count() > 0:
+                                name = (await details_el.first.inner_text()).split("\n")[0].strip()
+
                         if name:
                             current_page_names.append(name)
+                            
                     except PlaywrightError:
                         pass
 
-                # Detect repeated pages
+                # If it fails to find names, dump the HTML so we can debug it
+                if len(current_page_names) == 0 and len(cards) > 0:
+                    logger.warning("Could not extract names. HTML dump of first card:")
+                    logger.warning(await cards[0].inner_html())
+
                 page_signature = tuple(current_page_names)
                 if page_signature in visited_pages:
-                    logger.warning("Repeated page detected. Stopping pagination.")
                     break
                 visited_pages.add(page_signature)
 
-                # Remove duplicates
                 for name in current_page_names:
                     if name not in seen_usernames:
                         seen_usernames.add(name)
                         all_usernames.append(name)
 
-                # Find next button
                 next_button = page.locator("div[class*='controls'] button").nth(1)
-
                 if not await next_button.is_visible() or not await next_button.is_enabled():
                     break
 
-                previous_signature = page_signature
-
-                # Click next and wait for content change
                 try:
                     await next_button.click(timeout=5000)
-                    await page.wait_for_function(
-                        """
-                        (args) => {
-                            const cards = document.querySelectorAll(args.selector);
-                            const names = Array.from(cards).map(card => {
-                                const el = card.querySelector("p.displayName");
-                                return el ? el.innerText.trim() : "";
-                            });
-                            return JSON.stringify(names) !== args.previous;
-                        }
-                        """,
-                        arg={
-                            "selector": review_selector,
-                            "previous": json.dumps(list(previous_signature))
-                        },
-                        timeout=10000
-                    )
+                    await asyncio.sleep(2)
                     page_num += 1
                 except PlaywrightTimeoutError:
-                    logger.warning("Pagination did not produce new content. Stopping.")
                     break
 
-            status_text.success(f"Successfully extracted {len(all_usernames)} unique usernames from {page_num} page(s).")
+            status_text.success(f"Successfully extracted {len(all_usernames)} unique usernames.")
             return all_usernames
 
-    except PlaywrightTimeoutError:
-        status_text.error("The operation timed out. VGen may be loading slowly or its page structure may have changed.")
-        logger.exception("Playwright timeout")
-        return None
-    except PlaywrightError as e:
-        status_text.error(f"A browser error occurred: {e}")
-        logger.exception("Playwright browser error")
-        return None
     except Exception as e:
         status_text.error(f"An unexpected error occurred: {e}")
         logger.exception("Unexpected scraping error")
@@ -205,14 +187,13 @@ async def run_scraper(url):
         if browser:
             try:
                 await browser.close()
-            except PlaywrightError:
+            except:
                 pass
 
 # ============================================================
-# USERNAME DASHBOARD
+# USERNAME DASHBOARD (HTML/JS Template)
 # ============================================================
 def generate_username_dashboard(usernames):
-    # Escaping for safe JS injection
     js_array = (
         json.dumps(usernames, ensure_ascii=False)
         .replace("<", "\\u003c")
@@ -483,7 +464,7 @@ if st.button("Start Scraping", type="primary"):
             if usernames is None:
                 st.error("Scraping failed. Please try again.")
             elif len(usernames) == 0:
-                st.warning("Scraping completed, but no usernames were found.")
+                st.warning("Scraping completed, but no usernames were found. Check the app logs for HTML dumps.")
             else:
                 st.success(f"Found {len(usernames)} unique usernames.")
                 html_template = generate_username_dashboard(usernames)
