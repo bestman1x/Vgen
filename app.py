@@ -1,9 +1,9 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import asyncio
 import json
 import logging
 import os
+import urllib.parse
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
@@ -39,9 +39,15 @@ logger = logging.getLogger(__name__)
 # STREAMLIT INTERFACE
 # ============================================================
 st.title("📋 VGen Username Extractor")
-st.write("Enter a VGen profile URL below. Once scraped, your interactive Username Copy List will appear.")
+st.write("Enter a VGen profile URL and select the page range you want to extract.")
 
 url_input = st.text_input("VGen Profile URL", "https://vgen.co/fafysstuff_")
+
+col1, col2 = st.columns(2)
+with col1:
+    start_page = st.number_input("Start Page", min_value=1, value=1, step=1)
+with col2:
+    end_page = st.number_input("End Page (Leave high to get all)", min_value=1, value=999, step=1)
 
 # ============================================================
 # URL VALIDATION
@@ -62,11 +68,10 @@ def validate_vgen_url(url):
 # ============================================================
 # SCRAPER
 # ============================================================
-async def run_scraper(url):
+async def run_scraper(url, start_pg, end_pg):
     browser = None
     all_usernames = []
     seen_usernames = set()
-    visited_pages = set()
     status_text = st.empty()
 
     try:
@@ -80,7 +85,6 @@ async def run_scraper(url):
         async with p_manager as p:
             browser = await p.chromium.launch(headless=True)
             
-            # Force a desktop layout so VGen doesn't hide text names
             context = await browser.new_context(
                 user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -116,21 +120,33 @@ async def run_scraper(url):
                 status_text.warning("No review cards were found.")
                 return []
 
-            page_num = 1
-            while True:
-                status_text.info(f"Extracting usernames from page {page_num}...")
+            current_page = 1
+            
+            # Skip pages if start_pg is greater than 1
+            while current_page < start_pg:
+                next_button = page.locator("div[class*='controls'] button").nth(1)
+                if not await next_button.is_visible() or not await next_button.is_enabled():
+                    status_text.warning(f"Reached the last page before hitting Start Page {start_pg}.")
+                    return []
+                
+                status_text.info(f"Skipping to page {start_pg} (Currently on {current_page})...")
+                await next_button.click(timeout=5000)
+                await asyncio.sleep(1.5)
+                current_page += 1
+
+            # Start scraping from start_pg
+            while current_page <= end_pg:
+                status_text.info(f"Extracting usernames from page {current_page}...")
                 cards = await review_cards.all()
                 current_page_names = []
 
                 for card in cards:
                     name = None
                     try:
-                        # 1. Try the specific displayName paragraph
                         name_el = card.locator("p.displayName")
                         if await name_el.count() > 0:
                             name = (await name_el.first.inner_text()).strip()
                         
-                        # 2. Try any link that points to a VGen profile
                         if not name:
                             link_el = card.locator("a[href*='vgen.co/']")
                             if await link_el.count() > 0:
@@ -138,7 +154,6 @@ async def run_scraper(url):
                                 if href:
                                     name = href.split("vgen.co/")[-1].split("?")[0].strip("/")
                         
-                        # 3. Try grabbing the first line of the reviewer details
                         if not name:
                             details_el = card.locator("div[class*='reviewerDetails']")
                             if await details_el.count() > 0:
@@ -150,29 +165,24 @@ async def run_scraper(url):
                     except PlaywrightError:
                         pass
 
-                # If it fails to find names, dump the HTML so we can debug it
-                if len(current_page_names) == 0 and len(cards) > 0:
-                    logger.warning("Could not extract names. HTML dump of first card:")
-                    logger.warning(await cards[0].inner_html())
-
-                page_signature = tuple(current_page_names)
-                if page_signature in visited_pages:
-                    break
-                visited_pages.add(page_signature)
-
                 for name in current_page_names:
                     if name not in seen_usernames:
                         seen_usernames.add(name)
                         all_usernames.append(name)
 
+                # Check if we've reached the end_page limit
+                if current_page >= end_pg:
+                    break
+
+                # Go to next page
                 next_button = page.locator("div[class*='controls'] button").nth(1)
                 if not await next_button.is_visible() or not await next_button.is_enabled():
                     break
 
                 try:
                     await next_button.click(timeout=5000)
-                    await asyncio.sleep(2)
-                    page_num += 1
+                    await asyncio.sleep(1.5)
+                    current_page += 1
                 except PlaywrightTimeoutError:
                     break
 
@@ -191,264 +201,6 @@ async def run_scraper(url):
                 pass
 
 # ============================================================
-# USERNAME DASHBOARD (HTML/JS Template)
-# ============================================================
-def generate_username_dashboard(usernames):
-    js_array = (
-        json.dumps(usernames, ensure_ascii=False)
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-    )
-
-    html_template = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Usernames — Copy List</title>
-    <style>
-    :root {{
-        --bg: #0f1117; --card: #171a23; --card-hover: #1e2230; --text: #e6e9ef;
-        --muted: #8b93a7; --accent: #4f8cff; --accent-glow: rgba(79, 140, 255, 0.35);
-        --copied-bg: #22c55e; --copied-text: #04210f; --border: #262b39;
-        --streak: #f59e0b; --streak-glow: rgba(245, 158, 11, 0.35);
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-        margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        background: var(--bg); color: var(--text); padding: 24px; line-height: 1.4;
-    }}
-    header {{ max-width: 1100px; margin: 0 auto 16px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }}
-    h1 {{ font-size: 1.4rem; margin: 0; font-weight: 700; letter-spacing: -0.01em; }}
-    .stats {{ color: var(--muted); font-size: 0.9rem; }}
-    .streak-bar {{
-        max-width: 1100px; margin: 0 auto 16px; display: flex; align-items: center; gap: 12px;
-        padding: 12px 16px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; font-size: 0.92rem;
-    }}
-    .streak-bar .label {{ color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.06em; }}
-    .streak-bar .value {{ font-size: 1.4rem; font-weight: 800; color: var(--streak); min-width: 2ch; text-align: center; text-shadow: 0 0 12px var(--streak-glow); transition: transform 0.15s; }}
-    .streak-bar .value.bump {{ transform: scale(1.25); }}
-    .streak-bar .value.broken {{ color: var(--muted); text-shadow: none; }}
-    .streak-bar .sub {{ color: var(--muted); font-size: 0.82rem; margin-left: auto; }}
-    .toolbar {{ max-width: 1100px; margin: 0 auto 20px; display: flex; gap: 10px; flex-wrap: wrap; }}
-    .toolbar input {{ flex: 1 1 240px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 0.95rem; outline: none; transition: border-color 0.15s; }}
-    .toolbar input:focus {{ border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }}
-    .toolbar button {{ padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 0.9rem; cursor: pointer; transition: background 0.15s, border-color 0.15s; }}
-    .toolbar button:hover {{ background: var(--card-hover); border-color: var(--accent); }}
-    .grid {{ max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }}
-    .user-card {{ display: flex; align-items: center; gap: 10px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 8px 10px; transition: background 0.15s, border-color 0.15s; }}
-    .user-card:hover {{ background: var(--card-hover); }}
-    .user-card .sn {{ flex: 0 0 auto; min-width: 34px; height: 26px; display: inline-flex; align-items: center; justify-content: center; padding: 0 8px; border-radius: 7px; background: rgba(79, 140, 255, 0.1); border: 1px solid rgba(79, 140, 255, 0.25); color: var(--accent); font-size: 0.72rem; font-weight: 700; font-variant-numeric: tabular-nums; }}
-    .user-card .name {{ font-size: 0.92rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; padding: 4px 8px; border-radius: 7px; transition: background 0.2s, color 0.2s, box-shadow 0.2s; }}
-    .user-card .name.copied-name {{ background: var(--copied-bg); color: var(--copied-text); font-weight: 700; box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.35); animation: textPulse 0.6s ease-out; }}
-    @keyframes textPulse {{ 0% {{ box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6); }} 100% {{ box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.35); }} }}
-    .user-card .copy-btn {{ flex: 0 0 auto; border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 8px; padding: 6px 10px; font-size: 0.78rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }}
-    .user-card .copy-btn:hover {{ color: var(--text); border-color: var(--accent); background: rgba(79, 140, 255, 0.08); }}
-    .toast {{ position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(80px); background: var(--card); border: 1px solid var(--copied-bg); color: var(--text); padding: 10px 18px; border-radius: 10px; font-size: 0.9rem; opacity: 0; transition: transform 0.25s, opacity 0.25s; pointer-events: none; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }}
-    .toast.show {{ transform: translateX(-50%) translateY(0); opacity: 1; }}
-    @media (max-width: 520px) {{ body {{ padding: 14px; }} .grid {{ grid-template-columns: 1fr; }} .streak-bar {{ flex-wrap: wrap; }} }}
-    </style>
-    </head>
-    <body>
-    <header>
-        <h1>📋 Usernames</h1>
-        <div class="stats"><span id="count">0</span> usernames · <span id="shown">0</span> shown</div>
-    </header>
-    <div class="streak-bar">
-        <span class="label">🔥 Streak in a row</span>
-        <span class="value" id="streakValue">0</span>
-        <span class="sub" id="streakSub">Copy a username to start a streak</span>
-    </div>
-    <div class="toolbar">
-        <input id="search" type="text" placeholder="Search usernames…" autocomplete="off" />
-        <button id="clear-highlight">Clear highlight &amp; streak</button>
-    </div>
-    <div class="grid" id="grid"></div>
-    <div class="toast" id="toast">Copied!</div>
-
-    <script>
-    const usernames = {js_array};
-    const KEY_LAST = "lastCopiedUsername_v3";
-    const KEY_STREAK = "copyStreak_v3";
-
-    const grid = document.getElementById("grid");
-    const searchInput = document.getElementById("search");
-    const toast = document.getElementById("toast");
-    const countEl = document.getElementById("count");
-    const shownEl = document.getElementById("shown");
-    const clearBtn = document.getElementById("clear-highlight");
-    const streakValEl = document.getElementById("streakValue");
-    const streakSubEl = document.getElementById("streakSub");
-
-    let lastCopiedName = null;
-    let streak = 0;
-    let toastTimer = null;
-
-    function render(filter = "") {{
-        const q = filter.trim().toLowerCase();
-        const fragment = document.createDocumentFragment();
-        let shown = 0;
-
-        usernames.forEach((name, index) => {{
-            if (q && !name.toLowerCase().includes(q)) return;
-
-            const card = document.createElement("div");
-            card.className = "user-card";
-            card.dataset.index = index;
-            card.dataset.name = name;
-
-            const sn = document.createElement("span");
-            sn.className = "sn";
-            sn.textContent = index + 1;
-
-            const span = document.createElement("span");
-            span.className = "name";
-            span.textContent = name;
-            span.title = name;
-
-            const btn = document.createElement("button");
-            btn.className = "copy-btn";
-            btn.textContent = "Copy";
-            btn.addEventListener("click", () => copyUsername(index, name, span, btn));
-
-            card.appendChild(sn);
-            card.appendChild(span);
-            card.appendChild(btn);
-            fragment.appendChild(card);
-            shown++;
-        }});
-
-        grid.replaceChildren(fragment);
-        shownEl.textContent = shown;
-
-        if (lastCopiedName !== null) {{
-            const card = Array.from(grid.querySelectorAll(".user-card")).find(el => el.dataset.name === lastCopiedName);
-            if (card) {{
-                const nameSpan = card.querySelector(".name");
-                if (nameSpan) nameSpan.classList.add("copied-name");
-            }}
-        }}
-    }}
-
-    async function copyUsername(index, name, nameSpan, btn) {{
-        let ok = false;
-        if (navigator.clipboard && window.isSecureContext) {{
-            try {{ await navigator.clipboard.writeText(name); ok = true; }} catch (e) {{ console.warn(e); }}
-        }}
-        
-        if (!ok) {{
-            let ta = null;
-            try {{
-                ta = document.createElement("textarea");
-                ta.value = name;
-                ta.setAttribute("readonly", "");
-                ta.style.position = "fixed";
-                ta.style.top = "-9999px";
-                document.body.appendChild(ta);
-                ta.select();
-                ta.setSelectionRange(0, ta.value.length);
-                ok = document.execCommand("copy");
-            }} catch (e) {{ ok = false; }}
-            finally {{ if (ta && ta.parentNode) ta.parentNode.removeChild(ta); }}
-        }}
-
-        if (!ok) {{
-            showToast("Copy failed — long-press or right-click to copy");
-            return;
-        }}
-
-        const isSameAsLast = name === lastCopiedName;
-        if (isSameAsLast) {{
-            streak = 1;
-            streakValEl.classList.add("broken");
-            setTimeout(() => streakValEl.classList.remove("broken"), 500);
-        }} else {{
-            streak = (streak || 0) + 1;
-            streakValEl.classList.remove("broken");
-        }}
-
-        streakValEl.textContent = streak;
-        streakValEl.classList.remove("bump");
-        void streakValEl.offsetWidth;
-        streakValEl.classList.add("bump");
-
-        streakSubEl.textContent = streak === 1 ? "1 copy — keep going!" : `${{streak}} unique copies in a row 🔥`;
-
-        lastCopiedName = name;
-        try {{
-            localStorage.setItem(KEY_LAST, name);
-            localStorage.setItem(KEY_STREAK, String(streak));
-        }} catch (e) {{ console.warn(e); }}
-
-        grid.querySelectorAll(".name.copied-name").forEach(el => el.classList.remove("copied-name"));
-        nameSpan.classList.add("copied-name");
-
-        btn.textContent = "Copied!";
-        setTimeout(() => {{ btn.textContent = "Copy"; }}, 1200);
-        showToast(`Copied: ${{name}} · streak ${{streak}}`);
-    }}
-
-    function showToast(msg) {{
-        toast.textContent = msg;
-        toast.classList.add("show");
-        clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => toast.classList.remove("show"), 1800);
-    }}
-
-    function restoreAndScroll() {{
-        let saved = null;
-        let savedStreak = 0;
-        try {{
-            saved = localStorage.getItem(KEY_LAST);
-            savedStreak = parseInt(localStorage.getItem(KEY_STREAK) || "0", 10) || 0;
-        }} catch (e) {{ console.warn(e); }}
-
-        streak = savedStreak;
-        streakValEl.textContent = streak;
-        streakSubEl.textContent = streak === 0 ? "Copy a username to start a streak" : `${{streak}} unique cop${{streak === 1 ? "y" : "ies"}} in a row 🔥`;
-
-        if (!saved || !usernames.includes(saved)) return;
-        lastCopiedName = saved;
-
-        requestAnimationFrame(() => {{
-            const card = Array.from(grid.querySelectorAll(".user-card")).find(el => el.dataset.name === saved);
-            if (!card) return;
-            const nameSpan = card.querySelector(".name");
-            if (nameSpan) nameSpan.classList.add("copied-name");
-            card.scrollIntoView({{ behavior: "smooth", block: "center" }});
-        }});
-    }}
-
-    searchInput.addEventListener("input", (e) => render(e.target.value));
-
-    clearBtn.addEventListener("click", () => {{
-        try {{
-            localStorage.removeItem(KEY_LAST);
-            localStorage.removeItem(KEY_STREAK);
-        }} catch (e) {{ console.warn(e); }}
-        
-        lastCopiedName = null;
-        streak = 0;
-        streakValEl.textContent = "0";
-        streakValEl.classList.add("broken");
-        streakSubEl.textContent = "Copy a username to start a streak";
-        grid.querySelectorAll(".name.copied-name").forEach(el => el.classList.remove("copied-name"));
-        showToast("Highlight & streak cleared");
-    }});
-
-    countEl.textContent = usernames.length;
-    render();
-    window.addEventListener("load", restoreAndScroll);
-    if (document.readyState === "complete") restoreAndScroll();
-    </script>
-    </body>
-    </html>
-    """
-    return html_template
-
-# ============================================================
 # START SCRAPING
 # ============================================================
 if st.button("Start Scraping", type="primary"):
@@ -456,19 +208,50 @@ if st.button("Start Scraping", type="primary"):
         st.warning("Please enter a VGen profile URL.")
     elif not validate_vgen_url(url_input):
         st.error("Invalid URL. Please enter a valid VGen profile URL.")
+    elif start_page > end_page:
+        st.error("Start Page cannot be greater than End Page.")
     else:
         try:
             with st.spinner("Scraping in progress. Please wait..."):
-                usernames = asyncio.run(run_scraper(url_input.strip()))
+                usernames = asyncio.run(run_scraper(url_input.strip(), start_page, end_page))
 
             if usernames is None:
                 st.error("Scraping failed. Please try again.")
             elif len(usernames) == 0:
-                st.warning("Scraping completed, but no usernames were found. Check the app logs for HTML dumps.")
+                st.warning("Scraping completed, but no usernames were found. Did you select a valid page range?")
             else:
                 st.success(f"Found {len(usernames)} unique usernames.")
-                html_template = generate_username_dashboard(usernames)
-                components.html(html_template, height=1000, scrolling=True)
+                
+                # Generate the URL-encoded data string
+                json_str = json.dumps(usernames, ensure_ascii=False)
+                encoded_data = urllib.parse.quote(json_str)
+                
+                # IMPORTANT: REPLACE THIS WITH YOUR ACTUAL GITHUB PAGES URL
+                GITHUB_PAGES_URL = "https://bestman1x.github.io/Vgen/" 
+                
+                final_url = f"{GITHUB_PAGES_URL}#data={encoded_data}"
+                
+                st.info("🎉 Your custom copy-list is ready! Click the button below to open it.")
+                st.markdown(
+                    f"""
+                    <a href="{final_url}" target="_blank" style="
+                        display: inline-block;
+                        padding: 12px 24px;
+                        background-color: #4f8cff;
+                        color: white;
+                        text-decoration: none;
+                        border-radius: 8px;
+                        font-weight: bold;
+                        font-size: 16px;
+                        margin-top: 10px;
+                    ">
+                        🚀 Open Username Dashboard
+                    </a>
+                    """, 
+                    unsafe_allow_html=True
+                )
+                
+                st.caption("Note: You can bookmark or share the generated link. The data is stored entirely inside the URL!")
 
         except Exception:
             st.error("Something went wrong while running the scraper.")
