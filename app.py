@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 st.title("📋 VGen Username Extractor")
 st.write("Enter a VGen profile URL and select the page range you want to extract.")
 
-url_input = st.text_input("VGen Profile URL", "https://vgen.co/fafysstuff_")
+url_input = st.text_input("VGen Profile URL", "https://vgen.co/")
 
 col1, col2 = st.columns(2)
 with col1:
