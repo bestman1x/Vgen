@@ -3,6 +3,8 @@ import streamlit.components.v1 as components
 import asyncio
 import json
 import logging
+import os
+os.system("playwright install chromium")
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
