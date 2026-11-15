@@ -1,3 +1,4 @@
 streamlit
+pypdf
 playwright
 playwright-stealth
