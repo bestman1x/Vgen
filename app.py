@@ -5,7 +5,6 @@ import logging
 import os
 import urllib.parse
 import re
-import io
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 from pypdf import PdfReader
@@ -99,12 +98,16 @@ def last_token(line):
     parts = line.strip().split()
     return parts[-1] if parts else ''
 
-def parse_fiverr_text(text):
+def parse_fiverr_text(text, skip_ongoing=True):
     lines = text.split('\n')
     usernames = []
     seen = set()
 
-    def try_add(tok):
+    def try_add(tok, line_text=""):
+        # Check if user wants to skip ongoing collaborations
+        if skip_ongoing and 'collaboration' in line_text.lower():
+            return 
+            
         if is_username(tok) and tok not in seen:
             seen.add(tok)
             usernames.append(tok)
@@ -116,15 +119,20 @@ def parse_fiverr_text(text):
                 j = i - offset
                 if j >= 0:
                     tok = last_token(lines[j])
+                    
+                    # We check both the line with the username and the line with "Ongoing"
+                    check_text = lines[j] + " " + line
+                    
                     if is_username(tok):
-                        try_add(tok)
+                        try_add(tok, check_text)
                         break
 
     # RULE 2: Catch the last review (after "Duration")
     for i, line in enumerate(lines):
         if 'Duration' in line:
             for j in range(i + 1, min(i + 3, len(lines))):
-                try_add(last_token(lines[j]))
+                tok = last_token(lines[j])
+                try_add(tok, lines[j])
 
     return usernames
 
@@ -165,7 +173,9 @@ async def run_vgen_scraper(url, start_pg, end_pg, status_text):
             page = await context.new_page()
             page.set_default_timeout(15000)
 
+            # Fixed the NameError bug here
             if HAS_STEALTH_CLASS is False:
+                from playwright_stealth import stealth_async
                 await stealth_async(page)
 
             status_text.info("Opening VGen profile...")
@@ -305,6 +315,9 @@ with tab_fiverr:
     uploaded_file = st.file_uploader("Upload Fiverr PDF", type=["pdf"])
     
     if uploaded_file is not None:
+        # Checkbox to filter out ongoing collaborations
+        skip_collab = st.checkbox("Skip users with 'Ongoing collaboration' badge", value=True)
+        
         if st.button("Extract from PDF", type="primary"):
             with st.spinner("Parsing PDF..."):
                 try:
@@ -316,13 +329,13 @@ with tab_fiverr:
                         if extracted:
                             full_text += extracted + "\n"
                     
-                    # Parse usernames
-                    usernames = parse_fiverr_text(full_text)
+                    # Parse usernames, passing the checkbox value
+                    usernames = parse_fiverr_text(full_text, skip_ongoing=skip_collab)
                     
                     if usernames:
                         show_dashboard_button(usernames)
                     else:
-                        st.warning("No usernames could be extracted from this PDF. Make sure the PDF contains the Fiverr review section.")
+                        st.warning("No usernames could be extracted (or they were all skipped). Make sure the PDF contains the Fiverr review section.")
                         
                 except Exception as e:
                     st.error(f"Failed to read PDF: {e}")
